@@ -10,7 +10,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DesktopHostProcess } from '../src/host-process.ts'
 import { DesktopProjectManager } from '../src/project-manager.ts'
 import { resolveDesktopPaths } from '../src/paths.ts'
+import { desktopClientMetadata } from '../src/client-metadata.ts'
 import { connectDesktopWelcome, type DesktopWelcomeBackend } from '../src/welcome-backend.ts'
+import { authenticateWebHost } from '../src/web-document.ts'
 import { DESKTOP_HOST_PROTOCOL_VERSION } from '../src/host-protocol.ts'
 import { prepareDevelopmentProject } from '../scripts/development-project.ts'
 
@@ -27,7 +29,15 @@ async function mockPlatform() {
   let init: Record<string, string> = {}
   let failExchange = false
   const server = createServer((req, res) => {
-    if (req.headers['x-client-platform'] !== (process.platform === 'win32' ? 'desktop-win' : 'desktop-mac')) { res.writeHead(400).end(); return }
+    // The real Host composition identifies every Platform request with the five client headers.
+    const expected = {
+      'x-client-bundle-id': '', 'x-client-platform': process.platform === 'win32' ? 'desktop-win' : 'desktop-mac',
+      'x-client-version': '1.2.3', 'x-client-locale': 'en_US',
+      'x-client-timezone-offset': String(-new Date().getTimezoneOffset() * 60),
+    }
+    for (const [name, value] of Object.entries(expected)) {
+      if (req.headers[name] !== value) { res.writeHead(400).end(); return }
+    }
     if (req.headers.cookie !== 'test_gate=synthetic') { res.writeHead(403).end(); return }
     if (req.url === '/auth-api/v0/users/logout' && req.method === 'POST') {
       if (req.headers['x-dsh-auth-token'] !== 'dsh_mock_composition_test') { res.writeHead(401).end(); return }
@@ -75,6 +85,7 @@ async function mockPlatform() {
 
 describe.skipIf(!existsSync(builtHost))('built Desktop welcome flow', () => {
   it('persists explicit API keys and browser account login independently across Host restarts', async () => {
+    vi.stubEnv('DSH_CLIENT_VERSION', '1.2.3')
     const root = mkdtempSync(join(tmpdir(), 'dsh-desktop-welcome-'))
     let host: DesktopHostProcess | undefined
     const platform = await mockPlatform()
@@ -119,17 +130,7 @@ describe.skipIf(!existsSync(builtHost))('built Desktop welcome flow', () => {
         host = new DesktopHostProcess(process.execPath, project, paths.profile)
         const { url } = await host.start()
         hostOrigin = new URL(url).origin
-        let cookie = ''
-        const send: typeof fetch = async (input, init) => {
-          const headers = new Headers(init?.headers)
-          if (cookie !== '') headers.set('cookie', cookie)
-          const response = await fetch(input, { ...init, headers, redirect: 'manual' })
-          if (response.status !== 303) return response
-          cookie = response.headers.getSetCookie().map(value => value.split(';')[0]).join('; ')
-          await response.body?.cancel()
-          return fetch(new URL(response.headers.get('location')!, url), { headers: { cookie } })
-        }
-        backend = await connectDesktopWelcome(url, send, () => Promise.resolve(cookie))
+        backend = connectDesktopWelcome(url, await authenticateWebHost(url))
       }
       const status = async () => backend.read()
       const fingerprint = (): string => createHash('sha256')
@@ -147,7 +148,7 @@ describe.skipIf(!existsSync(builtHost))('built Desktop welcome flow', () => {
       expect(await status()).toMatchObject({ hasApiKey: true, localePreference: 'zh' })
       await restart()
       expect(await status()).toMatchObject({ hasApiKey: true })
-      await backend!.account.start('en')
+      await backend!.account.start(desktopClientMetadata('en'))
       await expect.poll(async () => (await backend!.account.state()).attempt?.phase).toBe('waiting-browser')
       expect(new URL(platform.callback()).origin).toBe(hostOrigin)
       platform.failExchange(true)
@@ -156,7 +157,7 @@ describe.skipIf(!existsSync(builtHost))('built Desktop welcome flow', () => {
       expect(await backend!.account.state()).toMatchObject({ status: 'signed-out', attempt: { phase: 'failed' } })
       expect(await status()).toMatchObject({ hasApiKey: true, loggedIn: false })
       platform.failExchange(false)
-      await backend!.account.start('en')
+      await backend!.account.start(desktopClientMetadata('en'))
       await expect.poll(async () => (await backend!.account.state()).attempt?.phase).toBe('waiting-browser')
       const response = await fetch(platform.callback(), { redirect: 'manual' })
       expect(response.status).toBe(302)
@@ -165,15 +166,20 @@ describe.skipIf(!existsSync(builtHost))('built Desktop welcome flow', () => {
       await restart()
       expect(await status()).toMatchObject({ hasApiKey: true, loggedIn: true })
       // A failed remote logout must not block local sign-out through the real Host composition.
-      await backend!.account.signOut()
+      await backend!.account.signOut(desktopClientMetadata('en'))
       expect(await status()).toMatchObject({ hasApiKey: true, loggedIn: false })
-      await backend!.account.start('en')
+      await backend!.account.start(desktopClientMetadata('en'))
       await expect.poll(async () => (await backend!.account.state()).attempt?.phase).toBe('waiting-browser')
       const waiting = await backend!.account.state()
       const late = platform.callback()
       await backend!.account.cancel(waiting.attempt!.id)
       expect((await fetch(late, { redirect: 'manual' })).status).not.toBe(302)
       expect(await status()).toMatchObject({ loggedIn: false })
+      // A handle left open after acknowledged teardown must not fail the update handoff.
+      vi.stubEnv('NODE_OPTIONS', `--import=data:text/javascript,${encodeURIComponent(
+        "process.on('message', message => { if (message?.type === 'shutdown') setInterval(() => {}, 1000) })")}`)
+      await restart()
+      await host!.stop(true)
     } finally {
       await host?.stop()
       await platform.close()
